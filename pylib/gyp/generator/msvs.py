@@ -83,6 +83,9 @@ generator_additional_non_configuration_keys = [
     'msvs_external_builder_build_cmd',
     'msvs_external_builder_clean_cmd',
     'msvs_external_builder_clcompile_cmd',
+    'msvs_enable_winrt',
+    'msvs_requires_importlibrary',
+    'msvs_enable_winphone',
 ]
 
 
@@ -1106,7 +1109,8 @@ def _AddConfigurationToMSVSProject(p, spec, config_type, config_name, config):
             for this configuration.
   """
   # Get the information for this configuration
-  include_dirs, resource_include_dirs = _GetIncludeDirs(config)
+  include_dirs, midl_include_dirs, resource_include_dirs = \
+      _GetIncludeDirs(config)
   libraries = _GetLibraries(spec)
   library_dirs = _GetLibraryDirs(config)
   out_file, vc_tool, _ = _GetOutputFilePathAndTool(spec, msbuild=False)
@@ -1134,6 +1138,8 @@ def _AddConfigurationToMSVSProject(p, spec, config_type, config_name, config):
   # Add the information to the appropriate tool
   _ToolAppend(tools, 'VCCLCompilerTool',
               'AdditionalIncludeDirectories', include_dirs)
+  _ToolAppend(tools, 'VCMIDLTool',
+              'AdditionalIncludeDirectories', midl_include_dirs)
   _ToolAppend(tools, 'VCResourceCompilerTool',
               'AdditionalIncludeDirectories', resource_include_dirs)
   # Add in libraries.
@@ -1189,10 +1195,14 @@ def _GetIncludeDirs(config):
   include_dirs = (
       config.get('include_dirs', []) +
       config.get('msvs_system_include_dirs', []))
+  midl_include_dirs = (
+      config.get('midl_include_dirs', []) +
+      config.get('msvs_system_include_dirs', []))
   resource_include_dirs = config.get('resource_include_dirs', include_dirs)
   include_dirs = _FixPaths(include_dirs)
+  midl_include_dirs = _FixPaths(midl_include_dirs)
   resource_include_dirs = _FixPaths(resource_include_dirs)
-  return include_dirs, resource_include_dirs
+  return include_dirs, midl_include_dirs, resource_include_dirs
 
 
 def _GetLibraryDirs(config):
@@ -2595,15 +2605,26 @@ def _GetMSBuildProjectConfigurations(configurations):
 
 def _GetMSBuildGlobalProperties(spec, guid, gyp_file_name):
   namespace = os.path.splitext(gyp_file_name)[0]
-  return [
+  properties = [
       ['PropertyGroup', {'Label': 'Globals'},
-       ['ProjectGuid', guid],
-       ['Keyword', 'Win32Proj'],
-       ['RootNamespace', namespace],
-       ['IgnoreWarnCompileDuplicatedFilename', 'true'],
+        ['ProjectGuid', guid],
+        ['Keyword', 'Win32Proj'],
+        ['RootNamespace', namespace],
+        ['IgnoreWarnCompileDuplicatedFilename', 'true'],
       ]
-  ]
+    ]
 
+  if spec.get('msvs_enable_winrt'):
+    properties[0].append(['DefaultLanguage', 'en-US'])
+    properties[0].append(['AppContainerApplication', 'true'])
+    properties[0].append(['ApplicationTypeRevision', '8.1'])
+
+    if spec.get('msvs_enable_winphone'):
+      properties[0].append(['ApplicationType', 'Windows Phone'])
+    else:
+      properties[0].append(['ApplicationType', 'Windows Store'])
+
+  return properties
 
 def _GetMSBuildConfigurationDetails(spec, build_file):
   properties = {}
@@ -2614,8 +2635,9 @@ def _GetMSBuildConfigurationDetails(spec, build_file):
     _AddConditionalProperty(properties, condition, 'ConfigurationType',
                             msbuild_attributes['ConfigurationType'])
     if character_set:
-      _AddConditionalProperty(properties, condition, 'CharacterSet',
-                              character_set)
+      if 'msvs_enable_winrt' not in spec :
+        _AddConditionalProperty(properties, condition, 'CharacterSet',
+                                character_set)
   return _GetMSBuildPropertyGroup(spec, 'Configuration', properties)
 
 
@@ -2914,7 +2936,8 @@ def _FinalizeMSBuildSettings(spec, configuration):
     converted = True
     msvs_settings = configuration.get('msvs_settings', {})
     msbuild_settings = MSVSSettings.ConvertToMSBuildSettings(msvs_settings)
-  include_dirs, resource_include_dirs = _GetIncludeDirs(configuration)
+  include_dirs, midl_include_dirs, resource_include_dirs = \
+      _GetIncludeDirs(configuration)
   libraries = _GetLibraries(spec)
   library_dirs = _GetLibraryDirs(configuration)
   out_file, _, msbuild_tool = _GetOutputFilePathAndTool(spec, msbuild=True)
@@ -2944,6 +2967,8 @@ def _FinalizeMSBuildSettings(spec, configuration):
   # if you don't have any resources.
   _ToolAppend(msbuild_settings, 'ClCompile',
               'AdditionalIncludeDirectories', include_dirs)
+  _ToolAppend(msbuild_settings, 'Midl',
+              'AdditionalIncludeDirectories', midl_include_dirs)
   _ToolAppend(msbuild_settings, 'ResourceCompile',
               'AdditionalIncludeDirectories', resource_include_dirs)
   # Add in libraries, note that even for empty libraries, we want this
@@ -2974,6 +2999,13 @@ def _FinalizeMSBuildSettings(spec, configuration):
                 'PrecompiledHeaderFile', precompiled_header)
     _ToolAppend(msbuild_settings, 'ClCompile',
                 'ForcedIncludeFiles', [precompiled_header])
+  else:
+    _ToolAppend(msbuild_settings, 'ClCompile', 'PrecompiledHeader', 'NotUsing')
+  # Turn off WinRT compilation
+  _ToolAppend(msbuild_settings, 'ClCompile', 'CompileAsWinRT', 'false')
+  # Turn on import libraries if appropriate
+  if spec.get('msvs_requires_importlibrary'):
+   _ToolAppend(msbuild_settings, '', 'IgnoreImportLibrary', 'false')
   # Loadable modules don't generate import libraries;
   # tell dependent projects to not expect one.
   if spec['type'] == 'loadable_module':
@@ -3214,7 +3246,10 @@ def _GenerateMSBuildProject(project, options, version, generator_flags):
   content += _GetMSBuildGlobalProperties(spec, project.guid, project_file_name)
   content += import_default_section
   content += _GetMSBuildConfigurationDetails(spec, project.build_file)
-  content += _GetMSBuildLocalProperties(project.msbuild_toolset)
+  if spec.get('msvs_enable_winphone'):
+   content += _GetMSBuildLocalProperties('v120_wp81')
+  else:
+   content += _GetMSBuildLocalProperties(project.msbuild_toolset)
   content += import_cpp_props_section
   content += _GetMSBuildExtensions(props_files_of_rules)
   content += _GetMSBuildPropertySheets(configurations)
